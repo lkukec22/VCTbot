@@ -36,6 +36,7 @@ if not TOKEN:
 
 # Set up intents
 intents = discord.Intents.default()
+intents.guilds = True  # Required for slash commands
 
 # Create bot instance with slash commands only
 class ValorantBot(commands.Bot):
@@ -43,8 +44,14 @@ class ValorantBot(commands.Bot):
         super().__init__(command_prefix="", intents=intents, help_command=None)
 
     async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Slash commands synced")
+        # Force sync all slash commands with Discord
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Slash commands synced: {len(synced)} commands")
+            for cmd in synced:
+                logger.info(f"Synced command: {cmd.name}")
+        except Exception as e:
+            logger.error(f"Error syncing slash commands: {e}")
 
 bot = ValorantBot()
 
@@ -440,6 +447,13 @@ async def on_ready():
     keep_alive.start()
     logger.info("Keep-alive task started")
 
+    # Try to sync commands again on startup
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Commands synced on startup: {len(synced)} commands")
+    except Exception as e:
+        logger.error(f"Error syncing commands on startup: {e}")
+
 class ResultsPaginator(ui.View):
     def __init__(self, results, upcoming=False, team=None, tournament=None, timeout=180):
         super().__init__(timeout=timeout)
@@ -800,6 +814,26 @@ async def slash_tournament(interaction: discord.Interaction, tournament_name: st
         paginator.message = await interaction.followup.send(embed=embed, view=paginator)
     else:
         await interaction.followup.send(embed=embed)
+
+# Command to force sync slash commands (owner only)
+@bot.tree.command(name="sync", description="Force sync slash commands with Discord (Owner only)")
+async def sync_commands(interaction: discord.Interaction):
+    """Owner-only command to force sync slash commands"""
+    # Check if the user is the bot owner
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message("This command can only be used by the bot owner.", ephemeral=True)
+        return
+
+    # Sync commands
+    try:
+        await interaction.response.defer(ephemeral=True)
+        synced = await bot.tree.sync()
+        await interaction.followup.send(f"Successfully synced {len(synced)} commands!", ephemeral=True)
+        logger.info(f"Commands manually synced by owner: {len(synced)} commands")
+    except Exception as e:
+        await interaction.followup.send(f"Error syncing commands: {e}", ephemeral=True)
+        logger.error(f"Error during manual command sync: {e}")
 
 # Help command
 @bot.tree.command(name="help", description="Show bot commands and information")
