@@ -11,6 +11,10 @@ import threading
 import math
 import random
 import time
+import sqlite3
+import pytz
+from dateutil import parser
+from fuzzywuzzy import process
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -66,6 +70,22 @@ results_cache = {
     'last_success': None
 }
 
+# Team aliases for common team name variations
+TEAM_ALIASES = {
+    'c9': 'cloud9',
+    '100t': '100 thieves',
+    'sen': 'sentinels',
+    'eg': 'evil geniuses',
+    'tl': 'liquid',
+    'fnc': 'fnatic',
+    'prx': 'paper rex',
+    'geng': 'gen.g',
+    'leviatan': 'leviatán',
+    'levi': 'leviatán',
+    'krü': 'kru',
+    'krue': 'kru',
+}
+
 # Team colors for popular Valorant teams
 TEAM_COLORS = {
     'sentinels': 0xFF0000,
@@ -86,6 +106,18 @@ TEAM_COLORS = {
     'kru': 0x00FFFF,
 }
 
+# Tournament aliases for common tournament name variations
+TOURNAMENT_ALIASES = {
+    'vct': 'vct',
+    'masters': 'masters',
+    'champs': 'champions',
+    'gc': 'game changers',
+    'gamechangers': 'game changers',
+    'challengers': 'challengers',
+    'chal': 'challengers',
+    'asc': 'ascension',
+}
+
 # Tournament colors
 TOURNAMENT_COLORS = {
     'vct': 0xFF4500,
@@ -95,6 +127,154 @@ TOURNAMENT_COLORS = {
     'game changers': 0xFF69B4,
     'challengers': 0x4169E1,
 }
+
+# Timezone utilities
+def get_timezone_list():
+    """Get a list of common timezones"""
+    common_timezones = [
+        'UTC', 'US/Eastern', 'US/Central', 'US/Mountain', 'US/Pacific',
+        'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
+        'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Seoul', 'Australia/Sydney',
+        'America/Sao_Paulo', 'America/Los_Angeles', 'America/New_York'
+    ]
+    return common_timezones
+
+def is_valid_timezone(timezone_str):
+    """Check if a timezone string is valid"""
+    try:
+        pytz.timezone(timezone_str)
+        return True
+    except pytz.exceptions.UnknownTimeZoneError:
+        return False
+
+def parse_match_time(time_str, server_timezone='UTC'):
+    """Parse match time string and convert to a datetime object"""
+    try:
+        # Try to parse the time string
+        if 'in ' in time_str.lower():
+            # Relative time (e.g., "in 2h")
+            time_parts = time_str.lower().replace('in ', '').strip().split()
+            if len(time_parts) >= 1:
+                value = int(''.join(filter(str.isdigit, time_parts[0])))
+                unit = ''.join(filter(str.isalpha, time_parts[0]))
+
+                now = datetime.datetime.now(pytz.timezone(server_timezone))
+
+                if unit.startswith('h'):
+                    match_time = now + datetime.timedelta(hours=value)
+                elif unit.startswith('m'):
+                    match_time = now + datetime.timedelta(minutes=value)
+                elif unit.startswith('d'):
+                    match_time = now + datetime.timedelta(days=value)
+                else:
+                    # Default to hours if unit is unclear
+                    match_time = now + datetime.timedelta(hours=value)
+
+                return match_time
+        else:
+            # Try to parse as absolute time
+            match_time = parser.parse(time_str)
+
+            # If no timezone info, assume UTC
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=pytz.UTC)
+
+            return match_time
+    except Exception as e:
+        logger.error(f"Error parsing match time '{time_str}': {e}")
+        return None
+
+def format_match_time(dt, target_timezone='UTC'):
+    """Format a datetime object for display in the specified timezone"""
+    if dt is None:
+        return "Time unknown"
+
+    try:
+        # Ensure datetime has timezone info
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+
+        # Convert to target timezone
+        local_dt = dt.astimezone(pytz.timezone(target_timezone))
+
+        # Format the time
+        formatted_time = local_dt.strftime("%Y-%m-%d %H:%M %Z")
+
+        # Calculate time difference from now
+        now = datetime.datetime.now(pytz.timezone(target_timezone))
+        time_diff = local_dt - now
+
+        # Format relative time
+        if time_diff.total_seconds() < 0:
+            relative = "(Match has already started)"
+        elif time_diff.total_seconds() < 3600:  # Less than 1 hour
+            minutes = int(time_diff.total_seconds() / 60)
+            relative = f"(in {minutes} minutes)"
+        elif time_diff.total_seconds() < 86400:  # Less than 1 day
+            hours = int(time_diff.total_seconds() / 3600)
+            relative = f"(in {hours} hours)"
+        else:
+            days = int(time_diff.total_seconds() / 86400)
+            relative = f"(in {days} days)"
+
+        return f"{formatted_time} {relative}"
+    except Exception as e:
+        logger.error(f"Error formatting match time: {e}")
+        return "Time format error"
+
+# Function to resolve team name from input, handling aliases and fuzzy matching
+def resolve_team_name(team_input):
+    """Resolve team name from input, handling aliases and fuzzy matching"""
+    if not team_input:
+        return team_input
+
+    team_lower = team_input.lower()
+
+    # Check for direct alias
+    if team_lower in TEAM_ALIASES:
+        logger.info(f"Resolved team alias: {team_input} -> {TEAM_ALIASES[team_lower]}")
+        return TEAM_ALIASES[team_lower]
+
+    # Check for direct match in team colors
+    for team in TEAM_COLORS.keys():
+        if team_lower == team or team_lower in team:
+            return team
+
+    # Try fuzzy matching
+    matches = process.extractOne(team_lower, list(TEAM_COLORS.keys()), score_cutoff=80)
+    if matches:
+        logger.info(f"Fuzzy matched team: {team_input} -> {matches[0]} (score: {matches[1]})")
+        return matches[0]
+
+    # Return original if no match found
+    return team_input
+
+# Function to resolve tournament name from input, handling aliases and fuzzy matching
+def resolve_tournament_name(tournament_input):
+    """Resolve tournament name from input, handling aliases and fuzzy matching"""
+    if not tournament_input:
+        return tournament_input
+
+    tournament_lower = tournament_input.lower()
+
+    # Check for direct alias
+    if tournament_lower in TOURNAMENT_ALIASES:
+        logger.info(f"Resolved tournament alias: {tournament_input} -> {TOURNAMENT_ALIASES[tournament_lower]}")
+        return TOURNAMENT_ALIASES[tournament_lower]
+
+    # Check for direct match in tournament colors
+    for tournament in TOURNAMENT_COLORS.keys():
+        if tournament_lower == tournament or tournament_lower in tournament:
+            return tournament
+
+    # Try fuzzy matching
+    matches = process.extractOne(tournament_lower, list(TOURNAMENT_COLORS.keys()), score_cutoff=80)
+    if matches:
+        logger.info(f"Fuzzy matched tournament: {tournament_input} -> {matches[0]} (score: {matches[1]})")
+        return matches[0]
+
+    # Return original if no match found
+    return tournament_input
 
 # Function to get color for a team or tournament
 def get_entity_color(name, is_tournament=False):
@@ -393,6 +573,118 @@ async def get_valorant_results(limit=5, upcoming=False, team=None, tournament=No
         logger.error(f"Unexpected error: {e} (Failure #{results_cache['scraping_failures']})")
         return None
 
+async def get_match_details(match_url):
+    """
+    Scrapes detailed information about a specific match from vlr.gg.
+
+    Args:
+        match_url (str): URL of the match to scrape
+
+    Returns:
+        dict: Detailed match information or None if an error occurred
+    """
+    # Ensure the URL is complete
+    if not match_url.startswith('http'):
+        match_url = f"https://www.vlr.gg{match_url}"
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    try:
+        logger.info(f"Fetching match details from {match_url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(match_url, headers=headers, timeout=10) as response:
+                response.raise_for_status()
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+
+        # Initialize match details
+        match_details = {
+            'team1': "Unknown",
+            'team2': "Unknown",
+            'score1': "?",
+            'score2': "?",
+            'status': "Unknown",
+            'event': "Unknown Event",
+            'stage': "",
+            'time': "TBD",
+            'maps': [],
+            'url': match_url
+        }
+
+        # Extract team names
+        team_headers = soup.select('.match-header-vs-team-name')
+        if len(team_headers) >= 2:
+            match_details['team1'] = team_headers[0].get_text(strip=True)
+            match_details['team2'] = team_headers[1].get_text(strip=True)
+
+        # Extract scores
+        score_elements = soup.select('.match-header-vs-score-score')
+        if len(score_elements) >= 2:
+            match_details['score1'] = score_elements[0].get_text(strip=True) or "?"
+            match_details['score2'] = score_elements[1].get_text(strip=True) or "?"
+
+        # Extract event info
+        event_element = soup.select_one('.match-header-event-series')
+        if event_element:
+            event_text = event_element.get_text(strip=True)
+            if '–' in event_text or '-' in event_text:
+                separator = '–' if '–' in event_text else '-'
+                event_parts = event_text.split(separator, 1)
+                match_details['stage'] = event_parts[0].strip()
+                match_details['event'] = event_parts[1].strip() if len(event_parts) > 1 else event_parts[0].strip()
+            else:
+                match_details['event'] = event_text
+
+        # Extract match status
+        status_element = soup.select_one('.match-header-vs-note')
+        if status_element:
+            match_details['status'] = status_element.get_text(strip=True)
+
+        # Extract match time
+        time_element = soup.select_one('.match-header-date')
+        if time_element:
+            match_details['time'] = time_element.get_text(strip=True)
+
+        # Extract map details
+        map_elements = soup.select('.vm-stats-game')
+        for map_element in map_elements:
+            map_name_element = map_element.select_one('.map-name')
+            map_name = map_name_element.get_text(strip=True) if map_name_element else "Unknown Map"
+
+            map_score_elements = map_element.select('.score')
+            map_score1 = "?"
+            map_score2 = "?"
+            if len(map_score_elements) >= 2:
+                map_score1 = map_score_elements[0].get_text(strip=True)
+                map_score2 = map_score_elements[1].get_text(strip=True)
+
+            match_details['maps'].append({
+                'name': map_name,
+                'score1': map_score1,
+                'score2': map_score2
+            })
+
+        return match_details
+
+    except aiohttp.ClientResponseError as e:
+        logger.error(f"Error in response from vlr.gg: {e.status} {e.message}")
+        return None
+    except aiohttp.ClientConnectorError as e:
+        logger.error(f"Connection error when accessing vlr.gg: {e}")
+        return None
+    except aiohttp.ClientTimeout as e:
+        logger.error(f"Request to vlr.gg timed out: {e}")
+        return None
+    except aiohttp.ClientError as e:
+        logger.error(f"Client error when accessing vlr.gg: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return None
+
+
 async def check_scraping_health():
     """Check the health of the web scraping and alert if there are issues"""
     if results_cache['scraping_failures'] >= 5:
@@ -424,6 +716,81 @@ async def health_check_task():
         else:
             logger.warning("Test scrape failed, scraping issues persist")
 
+@tasks.loop(minutes=5)
+async def reminder_check_task():
+    """Periodic task to check for match reminders"""
+    logger.info("Checking for match reminders")
+
+    # Get pending reminders
+    reminders = get_pending_reminders()
+    if not reminders:
+        return
+
+    logger.info(f"Found {len(reminders)} pending reminders")
+
+    # Current time in UTC
+    now = datetime.datetime.now(pytz.UTC)
+
+    for reminder in reminders:
+        try:
+            # Parse the match time
+            match_time = datetime.datetime.fromisoformat(reminder['match_time'])
+
+            # Calculate time until match
+            time_until_match = match_time - now
+
+            # If match is within 15 minutes or already started (but not more than 30 minutes ago)
+            if time_until_match.total_seconds() <= 900 and time_until_match.total_seconds() > -1800:
+                # Get the channel
+                channel = bot.get_channel(int(reminder['channel_id']))
+                if channel is None:
+                    logger.warning(f"Channel {reminder['channel_id']} not found for reminder {reminder['id']}")
+                    mark_reminder_as_sent(reminder['id'])
+                    continue
+
+                # Get the user
+                user = await bot.fetch_user(int(reminder['user_id']))
+                if user is None:
+                    logger.warning(f"User {reminder['user_id']} not found for reminder {reminder['id']}")
+                    mark_reminder_as_sent(reminder['id'])
+                    continue
+
+                # Create embed
+                embed = discord.Embed(
+                    title=f"{reminder['team1']} vs {reminder['team2']} - Match Reminder",
+                    description=f"The match is about to start!",
+                    color=discord.Color.gold(),
+                    url=reminder['match_url']
+                )
+
+                # Add match time
+                if time_until_match.total_seconds() > 0:
+                    minutes_until = int(time_until_match.total_seconds() / 60)
+                    embed.add_field(
+                        name="Time Until Match",
+                        value=f"Approximately {minutes_until} minutes",
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="Status",
+                        value="Match has started!",
+                        inline=False
+                    )
+
+                # Send the reminder
+                await channel.send(f"{user.mention} Here's your match reminder!", embed=embed)
+                logger.info(f"Sent reminder {reminder['id']} to user {user.name} for match {reminder['team1']} vs {reminder['team2']}")
+
+                # Mark the reminder as sent
+                mark_reminder_as_sent(reminder['id'])
+        except Exception as e:
+            logger.error(f"Error processing reminder {reminder['id']}: {e}")
+
+@reminder_check_task.before_loop
+async def before_reminder_check():
+    await bot.wait_until_ready()
+
 @health_check_task.before_loop
 async def before_health_check():
     await bot.wait_until_ready()
@@ -447,6 +814,10 @@ async def on_ready():
     keep_alive.start()
     logger.info("Keep-alive task started")
 
+    # Start the reminder check task
+    reminder_check_task.start()
+    logger.info("Reminder check task started")
+
     # Try to sync commands again on startup
     try:
         synced = await bot.tree.sync()
@@ -468,6 +839,10 @@ class ResultsPaginator(ui.View):
         if self.total_pages <= 1:
             self.previous_button.disabled = True
             self.next_button.disabled = True
+
+        # Only add reminder button for upcoming matches
+        if not upcoming:
+            self.remove_item(self.remind_button)
 
     @ui.button(label="Previous", style=discord.ButtonStyle.secondary, emoji="⬅️")
     async def previous_button(self, interaction: discord.Interaction, _: ui.Button):
@@ -501,6 +876,32 @@ class ResultsPaginator(ui.View):
         else:
             await interaction.response.defer()
 
+    @ui.button(label="Remind Me", style=discord.ButtonStyle.success, emoji="⏰")
+    async def remind_button(self, interaction: discord.Interaction, _: ui.Button):
+        # Get the current page results
+        current_results = self.get_current_page_results()
+
+        # Create a select menu with the matches
+        select_options = []
+        for i, match in enumerate(current_results):
+            select_options.append(
+                discord.SelectOption(
+                    label=f"{match['team1']} vs {match['team2']}",
+                    description=f"{match['time']} - {match['event']}",
+                    value=str(i)
+                )
+            )
+
+        # Create the select menu view
+        view = MatchSelectView(current_results, interaction.user.id, interaction.channel_id)
+
+        # Send the select menu as an ephemeral message
+        await interaction.response.send_message(
+            "Select a match to be reminded about:",
+            view=view,
+            ephemeral=True
+        )
+
     async def on_timeout(self):
         """Called when the view times out"""
         for item in self.children:
@@ -517,6 +918,86 @@ class ResultsPaginator(ui.View):
         start_idx = self.current_page * self.results_per_page
         end_idx = start_idx + self.results_per_page
         return self.results[start_idx:end_idx]
+
+
+class MatchSelectView(ui.View):
+    """View for selecting a match to be reminded about"""
+    def __init__(self, matches, user_id, channel_id):
+        super().__init__(timeout=60)
+        self.matches = matches
+        self.user_id = user_id
+        self.channel_id = channel_id
+
+        # Add select menu with matches
+        select_options = []
+        for i, match in enumerate(matches):
+            select_options.append(
+                discord.SelectOption(
+                    label=f"{match['team1']} vs {match['team2']}",
+                    description=f"{match['time']} - {match['event']}",
+                    value=str(i)
+                )
+            )
+
+        self.select_menu = ui.Select(
+            placeholder="Select a match...",
+            options=select_options,
+            min_values=1,
+            max_values=1
+        )
+        self.select_menu.callback = self.select_callback
+        self.add_item(self.select_menu)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        """Callback for when a match is selected"""
+        # Get the selected match
+        match_index = int(self.select_menu.values[0])
+        match = self.matches[match_index]
+
+        # Parse the match time
+        match_time = match['time']
+
+        # Get server timezone
+        server_id = str(interaction.guild_id)
+        config = get_server_config(server_id)
+        server_timezone = config['timezone']
+
+        # Parse the match time
+        parsed_time = parse_match_time(match_time, server_timezone)
+        if parsed_time is None:
+            await interaction.response.send_message(
+                f"Could not parse match time: {match_time}. Please try another match.",
+                ephemeral=True
+            )
+            return
+
+        # Store the reminder in the database
+        add_match_reminder(
+            self.user_id,
+            self.channel_id,
+            match['url'],
+            parsed_time.isoformat(),
+            match['team1'],
+            match['team2']
+        )
+
+        # Format the time in the user's timezone
+        formatted_time = format_match_time(parsed_time, server_timezone)
+
+        # Send confirmation message
+        await interaction.response.send_message(
+            f"You will be reminded about the match between **{match['team1']}** and **{match['team2']}** at {formatted_time}.",
+            ephemeral=True
+        )
+
+        # Disable the select menu
+        self.select_menu.disabled = True
+        await interaction.edit_original_response(view=self)
+
+    async def on_timeout(self):
+        """Called when the view times out"""
+        for item in self.children:
+            item.disabled = True
 
 
 async def create_match_results_embed(results, upcoming=False, page_info=None, team=None, tournament=None):
@@ -724,8 +1205,13 @@ async def slash_team(interaction: discord.Interaction, team_name: str, count: in
     # Acknowledge the command
     await interaction.response.defer(thinking=True)
 
+    # Resolve team name using aliases and fuzzy matching
+    resolved_team = resolve_team_name(team_name)
+    if resolved_team != team_name:
+        await interaction.followup.send(f"Searching for team '{resolved_team}' (resolved from '{team_name}')")
+
     # Get team results
-    results = await get_valorant_results(count, upcoming=False, team=team_name)
+    results = await get_valorant_results(count, upcoming=False, team=resolved_team)
 
     if results is None:
         await interaction.followup.send("❌ Error connecting to vlr.gg. The website might be down or experiencing issues. Please try again later.")
@@ -783,8 +1269,13 @@ async def slash_tournament(interaction: discord.Interaction, tournament_name: st
     # Acknowledge the command
     await interaction.response.defer(thinking=True)
 
+    # Resolve tournament name using aliases and fuzzy matching
+    resolved_tournament = resolve_tournament_name(tournament_name)
+    if resolved_tournament != tournament_name:
+        await interaction.followup.send(f"Searching for tournament '{resolved_tournament}' (resolved from '{tournament_name}')")
+
     # Get tournament results
-    results = await get_valorant_results(count, upcoming=False, tournament=tournament_name)
+    results = await get_valorant_results(count, upcoming=False, tournament=resolved_tournament)
 
     if results is None:
         await interaction.followup.send("❌ Error connecting to vlr.gg. The website might be down or experiencing issues. Please try again later.")
@@ -835,6 +1326,262 @@ async def sync_commands(interaction: discord.Interaction):
         await interaction.followup.send(f"Error syncing commands: {e}", ephemeral=True)
         logger.error(f"Error during manual command sync: {e}")
 
+# Match details command
+@bot.tree.command(name="match_details", description="Get detailed information about a specific match")
+@app_commands.describe(match_url="URL of the match on vlr.gg")
+async def match_details(interaction: discord.Interaction, match_url: str):
+    """Slash command to get detailed information about a specific match"""
+    # Validate input
+    if not match_url or not (match_url.startswith("https://www.vlr.gg/") or match_url.startswith("https://vlr.gg/")):
+        await interaction.response.send_message("Please provide a valid vlr.gg match URL.", ephemeral=True)
+        return
+
+    # Acknowledge the command
+    await interaction.response.defer(thinking=True)
+
+    # Get match details
+    match_details = await get_match_details(match_url)
+
+    if match_details is None:
+        await interaction.followup.send("❌ Error fetching match details. The URL might be invalid or vlr.gg might be experiencing issues.")
+        return
+
+    # Create embed
+    color = discord.Color.blue()
+    team1_lower = match_details['team1'].lower()
+    team2_lower = match_details['team2'].lower()
+
+    # Try to get team colors
+    for team, team_color in TEAM_COLORS.items():
+        if team in team1_lower:
+            color = discord.Color(team_color)
+            break
+        elif team in team2_lower:
+            color = discord.Color(team_color)
+            break
+
+    embed = discord.Embed(
+        title=f"{match_details['team1']} vs {match_details['team2']}",
+        description=f"**Event:** {match_details['event']}\n**Stage:** {match_details['stage']}",
+        color=color,
+        url=match_details['url']
+    )
+
+    # Add overall score
+    embed.add_field(
+        name="Overall Score",
+        value=f"**{match_details['team1']}** {match_details['score1']} - {match_details['score2']} **{match_details['team2']}**",
+        inline=False
+    )
+
+    # Add match status/time
+    if match_details['status']:
+        embed.add_field(
+            name="Status",
+            value=match_details['status'],
+            inline=True
+        )
+
+    if match_details['time']:
+        embed.add_field(
+            name="Time",
+            value=match_details['time'],
+            inline=True
+        )
+
+    # Add map details
+    if match_details['maps']:
+        maps_text = ""
+        for map_info in match_details['maps']:
+            maps_text += f"**{map_info['name']}**: {map_info['score1']} - {map_info['score2']}\n"
+
+        embed.add_field(
+            name="Maps",
+            value=maps_text,
+            inline=False
+        )
+
+    # Add timestamp
+    embed.set_footer(text=f"Data from vlr.gg • {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    await interaction.followup.send(embed=embed)
+
+# Server status command
+@bot.tree.command(name="server_status", description="Check Valorant server status")
+async def server_status(interaction: discord.Interaction):
+    """Slash command to check Valorant server status"""
+    await interaction.response.defer(thinking=True)
+
+    try:
+        # Fetch server status from Riot's status page
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://status.riotgames.com/valorant", timeout=10) as response:
+                if response.status != 200:
+                    await interaction.followup.send("❌ Error fetching server status. Please check https://status.riotgames.com/valorant manually.")
+                    return
+
+                # Create embed
+                embed = discord.Embed(
+                    title="Valorant Server Status",
+                    description="Current status of Valorant servers",
+                    color=discord.Color.green(),
+                    url="https://status.riotgames.com/valorant"
+                )
+
+                embed.add_field(
+                    name="Status Page",
+                    value="[Check Valorant Status Page](https://status.riotgames.com/valorant)",
+                    inline=False
+                )
+
+                embed.add_field(
+                    name="Riot Support",
+                    value="[Contact Riot Support](https://support-valorant.riotgames.com/)",
+                    inline=False
+                )
+
+                embed.set_footer(text=f"Data from Riot Games • {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+                await interaction.followup.send(embed=embed)
+    except Exception as e:
+        logger.error(f"Error fetching server status: {e}")
+        await interaction.followup.send(f"❌ Error fetching server status: {e}. Please check https://status.riotgames.com/valorant manually.")
+
+# Random agent command
+@bot.tree.command(name="random_agent", description="Get a random Valorant agent")
+async def random_agent(interaction: discord.Interaction):
+    """Slash command to get a random Valorant agent"""
+    VALORANT_AGENTS = [
+        "Astra", "Breach", "Brimstone", "Chamber", "Cypher", "Deadlock", "Fade", "Gekko",
+        "Harbor", "Jett", "KAY/O", "Killjoy", "Neon", "Omen", "Phoenix", "Raze", "Reyna",
+        "Sage", "Skye", "Sova", "Viper", "Yoru", "Iso", "Clove"
+    ]
+
+    agent = random.choice(VALORANT_AGENTS)
+
+    embed = discord.Embed(
+        title="Random Agent",
+        description=f"Your random agent is: **{agent}**",
+        color=discord.Color.blue()
+    )
+
+    # Try to add agent image if available
+    embed.set_thumbnail(url=f"https://valorant-api.com/v1/agents?name={agent}")
+
+    await interaction.response.send_message(embed=embed)
+
+# Random map command
+@bot.tree.command(name="random_map", description="Get a random Valorant map")
+async def random_map(interaction: discord.Interaction):
+    """Slash command to get a random Valorant map"""
+    VALORANT_MAPS = [
+        "Ascent", "Bind", "Breeze", "Fracture", "Haven", "Icebox", "Lotus", "Pearl", "Split", "Sunset"
+    ]
+
+    map_name = random.choice(VALORANT_MAPS)
+
+    embed = discord.Embed(
+        title="Random Map",
+        description=f"Your random map is: **{map_name}**",
+        color=discord.Color.green()
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+# Server configuration command
+@bot.tree.command(name="config", description="Configure server settings for the bot")
+@app_commands.describe(
+    setting="Setting to configure (default_count, timezone, announcement_channel)",
+    value="Value to set for the setting"
+)
+async def server_config(interaction: discord.Interaction, setting: str, value: str = None):
+    """Slash command to configure server settings"""
+    # Check if user has manage server permissions
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need 'Manage Server' permissions to use this command.", ephemeral=True)
+        return
+
+    # Get server ID
+    server_id = str(interaction.guild_id)
+
+    # If no value provided, show current setting
+    if value is None:
+        config = get_server_config(server_id)
+
+        if setting.lower() == "default_count":
+            await interaction.response.send_message(f"Current default count: {config['default_count']}", ephemeral=True)
+        elif setting.lower() == "timezone":
+            await interaction.response.send_message(f"Current timezone: {config['timezone']}", ephemeral=True)
+        elif setting.lower() == "announcement_channel":
+            channel_id = config['announcement_channel']
+            channel_name = "None" if channel_id is None else f"<#{channel_id}>"
+            await interaction.response.send_message(f"Current announcement channel: {channel_name}", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "Available settings:\n" +
+                "- `default_count`: Default number of results to display (5-20)\n" +
+                "- `timezone`: Server timezone (e.g., 'UTC', 'US/Eastern')\n" +
+                "- `announcement_channel`: Channel for match announcements",
+                ephemeral=True
+            )
+        return
+
+    # Update setting
+    if setting.lower() == "default_count":
+        try:
+            count = int(value)
+            if count < 5 or count > 20:
+                await interaction.response.send_message("Default count must be between 5 and 20.", ephemeral=True)
+                return
+
+            update_server_config(server_id, "default_count", count)
+            await interaction.response.send_message(f"Default count set to {count}.", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("Please provide a valid number for default_count.", ephemeral=True)
+
+    elif setting.lower() == "timezone":
+        if not is_valid_timezone(value):
+            # Show some common timezones
+            common_timezones = get_timezone_list()
+            await interaction.response.send_message(
+                f"Invalid timezone: '{value}'. Please use a valid timezone identifier.\n" +
+                f"Common timezones: {', '.join(common_timezones[:10])}...",
+                ephemeral=True
+            )
+            return
+
+        update_server_config(server_id, "timezone", value)
+        await interaction.response.send_message(f"Timezone set to {value}.", ephemeral=True)
+
+    elif setting.lower() == "announcement_channel":
+        if value.lower() == "none":
+            update_server_config(server_id, "announcement_channel", None)
+            await interaction.response.send_message("Announcement channel cleared.", ephemeral=True)
+            return
+
+        # Try to get channel ID from mention
+        channel_id = value.strip()
+        if channel_id.startswith("<#") and channel_id.endswith(">"):
+            # Extract the numeric ID from the mention
+            channel_id = channel_id[2:-1]
+
+        # Check if the channel exists
+        channel = interaction.guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
+        if channel is None:
+            await interaction.response.send_message(f"Channel not found. Please provide a valid channel mention or ID.", ephemeral=True)
+            return
+
+        update_server_config(server_id, "announcement_channel", channel_id)
+        await interaction.response.send_message(f"Announcement channel set to {channel.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "Unknown setting. Available settings:\n" +
+            "- `default_count`: Default number of results to display (5-20)\n" +
+            "- `timezone`: Server timezone (e.g., 'UTC', 'US/Eastern')\n" +
+            "- `announcement_channel`: Channel for match announcements",
+            ephemeral=True
+        )
+
 # Help command
 @bot.tree.command(name="help", description="Show bot commands and information")
 async def slash_help(interaction: discord.Interaction):
@@ -847,13 +1594,36 @@ async def slash_help(interaction: discord.Interaction):
 
     # Commands section
     embed.add_field(
-        name="📋 Commands",
+        name="📋 Match Commands",
         value=(
             "`/results [count]` - Get recent match results\n"
             "`/upcoming [count]` - Get upcoming matches\n"
             "`/team [team_name] [count]` - Search for a specific team\n"
             "`/tournament [tournament_name] [count]` - Search for a specific tournament\n"
+            "`/match_details [match_url]` - Get detailed information about a specific match\n"
+        ),
+        inline=False
+    )
+
+    # Utility commands section
+    embed.add_field(
+        name="🔧 Utility Commands",
+        value=(
+            "`/random_agent` - Get a random Valorant agent\n"
+            "`/random_map` - Get a random Valorant map\n"
+            "`/server_status` - Check Valorant server status\n"
             "`/help` - Show this help message\n"
+        ),
+        inline=False
+    )
+
+    # Configuration commands section
+    embed.add_field(
+        name="⚙️ Configuration Commands",
+        value=(
+            "`/config default_count [value]` - Set default number of results\n"
+            "`/config timezone [value]` - Set server timezone\n"
+            "`/config announcement_channel [value]` - Set announcement channel\n"
         ),
         inline=False
     )
@@ -878,9 +1648,14 @@ async def slash_help(interaction: discord.Interaction):
             "`/upcoming` - Show 5 upcoming matches\n"
             "`/upcoming 15` - Show 15 upcoming matches with pagination\n"
             "`/team sentinels` - Show 5 results for Sentinels\n"
-            "`/team cloud9 20` - Show 20 results for Cloud9 with pagination\n"
+            "`/team c9 20` - Show 20 results for Cloud9 with team alias\n"
             "`/tournament vct` - Show 5 results from VCT tournaments\n"
             "`/tournament masters 10` - Show 10 results from Masters tournaments\n"
+            "`/match_details https://www.vlr.gg/123456` - Get detailed info for a match\n"
+            "`/random_agent` - Get a random Valorant agent\n"
+            "`/random_map` - Get a random Valorant map\n"
+            "`/server_status` - Check Valorant server status\n"
+            "`/config timezone US/Eastern` - Set server timezone to US/Eastern\n"
         ),
         inline=False
     )
@@ -890,6 +1665,162 @@ async def slash_help(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+# Database setup
+DB_PATH = 'valorant_bot.db'
+
+def init_database():
+    """Initialize the SQLite database with required tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Create server configurations table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS server_configs (
+        server_id TEXT PRIMARY KEY,
+        default_count INTEGER DEFAULT 5,
+        timezone TEXT DEFAULT 'UTC',
+        announcement_channel TEXT
+    )
+    ''')
+
+    # Create match reminders table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS match_reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        match_url TEXT NOT NULL,
+        match_time TEXT NOT NULL,
+        team1 TEXT NOT NULL,
+        team2 TEXT NOT NULL,
+        reminded BOOLEAN DEFAULT FALSE,
+        created_at TEXT NOT NULL
+    )
+    ''')
+
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+# Initialize database on startup
+init_database()
+
+# Database helper functions
+def get_server_config(server_id):
+    """Get server configuration from database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM server_configs WHERE server_id = ?', (str(server_id),))
+    result = cursor.fetchone()
+
+    conn.close()
+
+    if result:
+        return {
+            'server_id': result[0],
+            'default_count': result[1],
+            'timezone': result[2],
+            'announcement_channel': result[3]
+        }
+    else:
+        # Return default config if not found
+        return {
+            'server_id': str(server_id),
+            'default_count': 5,
+            'timezone': 'UTC',
+            'announcement_channel': None
+        }
+
+def update_server_config(server_id, setting, value):
+    """Update server configuration in database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Check if server config exists
+    cursor.execute('SELECT * FROM server_configs WHERE server_id = ?', (str(server_id),))
+    result = cursor.fetchone()
+
+    if result:
+        # Update existing config
+        cursor.execute(f'UPDATE server_configs SET {setting} = ? WHERE server_id = ?', (value, str(server_id)))
+    else:
+        # Create new config with defaults and the specified setting
+        default_count = 5
+        timezone = 'UTC'
+        announcement_channel = None
+
+        if setting == 'default_count':
+            default_count = value
+        elif setting == 'timezone':
+            timezone = value
+        elif setting == 'announcement_channel':
+            announcement_channel = value
+
+        cursor.execute(
+            'INSERT INTO server_configs (server_id, default_count, timezone, announcement_channel) VALUES (?, ?, ?, ?)',
+            (str(server_id), default_count, timezone, announcement_channel)
+        )
+
+    conn.commit()
+    conn.close()
+    return True
+
+def add_match_reminder(user_id, channel_id, match_url, match_time, team1, team2):
+    """Add a match reminder to the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    created_at = datetime.datetime.now().isoformat()
+
+    cursor.execute(
+        'INSERT INTO match_reminders (user_id, channel_id, match_url, match_time, team1, team2, reminded, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        (str(user_id), str(channel_id), match_url, match_time, team1, team2, False, created_at)
+    )
+
+    reminder_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    return reminder_id
+
+def get_pending_reminders():
+    """Get all pending match reminders"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM match_reminders WHERE reminded = 0')
+    results = cursor.fetchall()
+
+    reminders = []
+    for result in results:
+        reminders.append({
+            'id': result[0],
+            'user_id': result[1],
+            'channel_id': result[2],
+            'match_url': result[3],
+            'match_time': result[4],
+            'team1': result[5],
+            'team2': result[6],
+            'reminded': bool(result[7]),
+            'created_at': result[8]
+        })
+
+    conn.close()
+    return reminders
+
+def mark_reminder_as_sent(reminder_id):
+    """Mark a reminder as sent"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute('UPDATE match_reminders SET reminded = 1 WHERE id = ?', (reminder_id,))
+
+    conn.commit()
+    conn.close()
+    return True
 
 # Track the last time the server was pinged
 last_ping_time = time.time()
