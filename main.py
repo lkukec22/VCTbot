@@ -72,10 +72,33 @@ async def get_valorant_results(limit=5):
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # Find match containers - updated selector for current vlr.gg structure
-        match_elements = soup.select('a[href^="/"]')
+        # Looking for match result entries which are <a> tags containing match info
+        match_elements = []
 
-        # Filter to only match result elements
-        match_elements = [m for m in match_elements if m.select('.match-item-vs') and m.get('href', '').startswith('/')]
+        # First, find all date headers (they're not inside the match elements)
+        date_headers = soup.find_all(lambda tag: tag.name == 'div' and tag.text.strip().endswith('Today') or
+                                              tag.text.strip().endswith('Yesterday'))
+
+        # For each date header, find the following match elements until the next date header
+        for header in date_headers[:2]:  # Only look at Today and Yesterday for recent matches
+            # Get the next elements after the date header
+            current = header.next_sibling
+
+            while current and (not isinstance(current, type(header)) or
+                              not (current.text.strip().endswith('Today') or
+                                   current.text.strip().endswith('Yesterday'))):
+                if current.name == 'a' and current.get('href', '').startswith('/'):
+                    match_elements.append(current)
+                current = current.next_sibling
+                if not current:
+                    break
+
+        if not match_elements:
+            # Fallback method - try to find all match elements directly
+            all_links = soup.find_all('a')
+            match_elements = [link for link in all_links if link.get('href', '').startswith('/') and
+                             len(link.get('href', '').split('/')) > 1 and
+                             any(x.isdigit() for x in link.get('href', '').split('/')[1].split('-'))]
 
         if not match_elements:
             logger.warning("No match elements found. Website structure might have changed.")
@@ -86,29 +109,59 @@ async def get_valorant_results(limit=5):
         results = []
         for match in match_elements[:limit]:
             try:
-                # Extract team names
-                team_elements = match.select('.mod-1, .mod-2')
-                team1 = team_elements[0].text.strip() if len(team_elements) > 0 else "Unknown"
-                team2 = team_elements[1].text.strip() if len(team_elements) > 1 else "Unknown"
+                # The structure is different now - team names are direct text nodes
+                # Extract all text nodes and filter
+                all_text = [text for text in match.stripped_strings]
 
-                # Extract scores
-                score_elements = match.select('.match-item-vs-score')
-                score1 = score_elements[0].text.strip() if len(score_elements) > 0 else "?"
-                score2 = score_elements[1].text.strip() if len(score_elements) > 1 else "?"
+                # Log the text content for debugging
+                logger.info(f"Match text content: {all_text}")
+
+                # Team names and scores are in specific positions
+                # Based on the HTML structure we observed
+                team1 = "Unknown"
+                team2 = "Unknown"
+                score1 = "?"
+                score2 = "?"
+
+                # Try different patterns to extract team names and scores
+                if len(all_text) >= 6:
+                    # Pattern: [time, team1, score1, team2, score2, status, ...]
+                    if all_text[0].count(':') == 1 and all_text[0].count(' ') <= 1:  # Looks like a time
+                        team1 = all_text[1]
+                        score1 = all_text[2]
+                        team2 = all_text[3]
+                        score2 = all_text[4]
+                    # Another common pattern
+                    elif len(all_text) >= 10 and all_text[2].isdigit() and all_text[4].isdigit():
+                        team1 = all_text[1]
+                        score1 = all_text[2]
+                        team2 = all_text[3]
+                        score2 = all_text[4]
 
                 # Extract event info
                 event_name = "Unknown Event"
                 event_stage = ""
 
-                # Try to get event info from different possible elements
-                event_element = match.select_one('.match-item-event')
-                if event_element:
-                    event_parts = event_element.text.strip().split('–')
-                    if len(event_parts) > 1:
+                # Event info is typically after "Completed" text
+                completed_index = -1
+                for i, text in enumerate(all_text):
+                    if text == "Completed":
+                        completed_index = i
+                        break
+
+                if completed_index != -1 and completed_index + 2 < len(all_text):
+                    # Event info is typically 2 elements after "Completed"
+                    event_text = all_text[completed_index + 2]
+                    if '–' in event_text:
+                        event_parts = event_text.split('–')
                         event_stage = event_parts[0].strip()
                         event_name = event_parts[1].strip()
                     else:
-                        event_name = event_parts[0].strip()
+                        event_name = event_text.strip()
+
+                    # The next element is usually the tournament name
+                    if completed_index + 3 < len(all_text):
+                        event_name = all_text[completed_index + 3]
 
                 # Format result
                 result = {
